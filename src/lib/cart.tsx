@@ -6,10 +6,12 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import type { CartItem, Product } from "./types";
+import { getBrowserSupabase } from "./supabase/client";
 
 const STORAGE_KEY = "furnilux-cart-v1";
 
@@ -26,10 +28,39 @@ type CartContextValue = {
 
 const CartContext = createContext<CartContextValue | null>(null);
 
+function parseItems(value: unknown): CartItem[] {
+  if (Array.isArray(value)) return value as CartItem[];
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function merge(local: CartItem[], remote: CartItem[]): CartItem[] {
+  const byId = new Map<string, CartItem>();
+  for (const r of remote) byId.set(r.productId, { ...r });
+  for (const l of local) {
+    const ex = byId.get(l.productId);
+    byId.set(
+      l.productId,
+      ex ? { ...ex, quantity: Math.max(ex.quantity, l.quantity) } : { ...l },
+    );
+  }
+  return [...byId.values()];
+}
+
 export function CartProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<CartItem[]>([]);
   const [hydrated, setHydrated] = useState(false);
+  const [userId, setUserId] = useState<string | null>(null);
+  const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Hydrate from localStorage (guests) once.
   useEffect(() => {
     const id = window.setTimeout(() => {
       try {
@@ -56,6 +87,56 @@ export function CartProvider({ children }: { children: ReactNode }) {
     return () => window.clearTimeout(id);
   }, []);
 
+  // Track auth state.
+  useEffect(() => {
+    const supabase = getBrowserSupabase();
+    if (!supabase) return;
+    supabase.auth.getUser().then(({ data }) => {
+      console.log("[cart] user:", data.user?.id ?? null);
+      setUserId(data.user?.id ?? null);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_e, session) => setUserId(session?.user?.id ?? null),
+    );
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  // On sign-in: load the shared cart and merge with any local items.
+  useEffect(() => {
+    if (!userId) return;
+    const supabase = getBrowserSupabase();
+    if (!supabase) return;
+    supabase
+      .from("carts")
+      .select("items")
+      .eq("user_id", userId)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        console.log("[cart] remote load:", error ?? `${parseItems(data?.items).length} items`);
+        setItems((local) => merge(local, parseItems(data?.items)));
+      });
+  }, [userId]);
+
+  // Refetch the shared cart when the tab regains focus (mobile edits appear).
+  useEffect(() => {
+    if (!userId) return;
+    const onFocus = () => {
+      const supabase = getBrowserSupabase();
+      if (!supabase) return;
+      supabase
+        .from("carts")
+        .select("items")
+        .eq("user_id", userId)
+        .maybeSingle()
+        .then(({ data }) => {
+          setItems(parseItems(data?.items));
+        });
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [userId]);
+
+  // Persist locally, and remotely (debounced) when signed in.
   useEffect(() => {
     if (!hydrated) return;
     try {
@@ -63,7 +144,24 @@ export function CartProvider({ children }: { children: ReactNode }) {
     } catch {
       // storage may be unavailable
     }
-  }, [items, hydrated]);
+    const supabase = getBrowserSupabase();
+    if (userId && supabase) {
+      if (syncTimer.current) clearTimeout(syncTimer.current);
+      syncTimer.current = setTimeout(() => {
+        supabase
+          .from("carts")
+          .upsert({
+            user_id: userId,
+            items,
+            updated_at: new Date().toISOString(),
+          })
+          .then(({ error }) => {
+            if (error) console.error("[cart sync] upsert failed:", error);
+            else console.log("[cart sync] upserted", items.length, "items");
+          });
+      }, 500);
+    }
+  }, [items, hydrated, userId]);
 
   const addItem = useCallback((product: Product, quantity = 1) => {
     setItems((prev) => {

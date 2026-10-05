@@ -45,6 +45,31 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
+-- ---------- carts (cross-device sync for signed-in users) ----------
+create table if not exists public.carts (
+  user_id uuid primary key references auth.users (id) on delete cascade,
+  items jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.carts enable row level security;
+
+drop policy if exists "users read own cart" on public.carts;
+create policy "users read own cart"
+  on public.carts for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "users insert own cart" on public.carts;
+create policy "users insert own cart"
+  on public.carts for insert
+  with check (auth.uid() = user_id);
+
+drop policy if exists "users update own cart" on public.carts;
+create policy "users update own cart"
+  on public.carts for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
 -- ---------- orders ----------
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
