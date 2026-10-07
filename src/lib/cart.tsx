@@ -41,26 +41,20 @@ function parseItems(value: unknown): CartItem[] {
   return [];
 }
 
-function merge(local: CartItem[], remote: CartItem[]): CartItem[] {
-  const byId = new Map<string, CartItem>();
-  for (const r of remote) byId.set(r.productId, { ...r });
-  for (const l of local) {
-    const ex = byId.get(l.productId);
-    byId.set(
-      l.productId,
-      ex ? { ...ex, quantity: Math.max(ex.quantity, l.quantity) } : { ...l },
-    );
-  }
-  return [...byId.values()];
-}
-
 export function CartProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<CartItem[]>([]);
   const [hydrated, setHydrated] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
-  const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [loadedUserId, setLoadedUserId] = useState<string | null>(null);
+  const localRevision = useRef(0);
+  const committedRevision = useRef(0);
+  const operationQueue = useRef<Promise<void>>(Promise.resolve());
+  const itemsRef = useRef(items);
+  const userIdRef = useRef(userId);
 
-  // Hydrate from localStorage (guests) once.
+  useEffect(() => { itemsRef.current = items; }, [items]);
+  useEffect(() => { userIdRef.current = userId; }, [userId]);
+
   useEffect(() => {
     const id = window.setTimeout(() => {
       try {
@@ -68,59 +62,94 @@ export function CartProvider({ children }: { children: ReactNode }) {
         if (raw) {
           const parsed = JSON.parse(raw);
           if (Array.isArray(parsed)) {
-            setItems(
-              parsed.filter(
-                (i): i is CartItem =>
-                  i &&
-                  typeof i.productId === "string" &&
-                  typeof i.quantity === "number" &&
-                  i.quantity > 0,
-              ),
-            );
+            setItems(parsed.filter((i) => i && typeof i.productId === "string" && typeof i.quantity === "number" && i.quantity > 0));
           }
         }
       } catch {
-        // ignore corrupt storage
+        // Ignore corrupt storage.
       }
       setHydrated(true);
     }, 0);
     return () => window.clearTimeout(id);
   }, []);
 
-  // Track auth state.
   useEffect(() => {
     const supabase = getBrowserSupabase();
     if (!supabase) return;
-    supabase.auth.getUser().then(({ data }) => {
-      console.log("[cart] user:", data.user?.id ?? null);
-      setUserId(data.user?.id ?? null);
-    });
+    supabase.auth.getUser().then(({ data }) => setUserId(data.user?.id ?? null));
     const { data: listener } = supabase.auth.onAuthStateChange(
-      (_e, session) => setUserId(session?.user?.id ?? null),
+      (_event, session) => setUserId(session?.user?.id ?? null),
     );
     return () => listener.subscription.unsubscribe();
   }, []);
 
-  // On sign-in: load the shared cart and merge with any local items.
   useEffect(() => {
-    if (!userId) return;
+    if (!hydrated || !userId) {
+      setLoadedUserId(null);
+      return;
+    }
     const supabase = getBrowserSupabase();
     if (!supabase) return;
+    let cancelled = false;
+    setLoadedUserId(null);
     supabase
       .from("carts")
       .select("items")
       .eq("user_id", userId)
       .maybeSingle()
-      .then(({ data, error }) => {
-        console.log("[cart] remote load:", error ?? `${parseItems(data?.items).length} items`);
-        setItems((local) => merge(local, parseItems(data?.items)));
+      .then(async ({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error("[cart] remote load failed:", error.message);
+          return;
+        }
+        let canonicalItems: CartItem[];
+        if (data) {
+          canonicalItems = parseItems(data.items);
+        } else {
+          const { data: initialized, error: initError } = await supabase.rpc(
+            "mutate_cart",
+            { p_action: "initialize", p_items: itemsRef.current },
+          );
+          if (cancelled) return;
+          if (initError) {
+            console.error("[cart] initialize failed:", initError.message);
+            return;
+          }
+          canonicalItems = parseItems(initialized);
+        }
+        committedRevision.current = localRevision.current;
+        setItems(canonicalItems);
+        setLoadedUserId(userId);
       });
-  }, [userId]);
+    return () => { cancelled = true; };
+  }, [userId, hydrated]);
 
-  // Refetch the shared cart when the tab regains focus (mobile edits appear).
   useEffect(() => {
-    if (!userId) return;
+    if (!userId || loadedUserId !== userId) return;
+    const supabase = getBrowserSupabase();
+    if (!supabase) return;
+    const channel = supabase
+      .channel("carts-updates")
+      .on("postgres_changes", {
+        event: "*",
+        schema: "public",
+        table: "carts",
+        filter: `user_id=eq.${userId}`,
+      }, (payload) => {
+        if (localRevision.current > committedRevision.current) return;
+        const row = payload.new as Record<string, unknown>;
+        committedRevision.current = localRevision.current;
+        setItems(parseItems(row?.items));
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [userId, loadedUserId]);
+
+  useEffect(() => {
+    if (!userId || loadedUserId !== userId) return;
     const onFocus = () => {
+      if (localRevision.current > committedRevision.current) return;
       const supabase = getBrowserSupabase();
       if (!supabase) return;
       supabase
@@ -128,98 +157,108 @@ export function CartProvider({ children }: { children: ReactNode }) {
         .select("items")
         .eq("user_id", userId)
         .maybeSingle()
-        .then(({ data }) => {
+        .then(({ data, error }) => {
+          if (error || localRevision.current > committedRevision.current) return;
+          committedRevision.current = localRevision.current;
           setItems(parseItems(data?.items));
         });
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [userId]);
+  }, [userId, loadedUserId]);
 
-  // Persist locally, and remotely (debounced) when signed in.
   useEffect(() => {
     if (!hydrated) return;
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
     } catch {
-      // storage may be unavailable
+      // Storage may be unavailable.
     }
+  }, [items, hydrated]);
+
+  const enqueueMutation = useCallback((
+    action: "add" | "set_quantity" | "remove" | "clear",
+    productId: string | null,
+    item: CartItem | null,
+    quantity: number | null,
+    update: (current: CartItem[]) => CartItem[],
+  ) => {
+    const revision = ++localRevision.current;
+    setItems(update);
+    const ownerId = userId;
     const supabase = getBrowserSupabase();
-    if (userId && supabase) {
-      if (syncTimer.current) clearTimeout(syncTimer.current);
-      syncTimer.current = setTimeout(() => {
-        supabase
-          .from("carts")
-          .upsert({
-            user_id: userId,
-            items,
-            updated_at: new Date().toISOString(),
-          })
-          .then(({ error }) => {
-            if (error) console.error("[cart sync] upsert failed:", error);
-            else console.log("[cart sync] upserted", items.length, "items");
-          });
-      }, 500);
-    }
-  }, [items, hydrated, userId]);
+    if (!ownerId || loadedUserId !== ownerId || !supabase) return;
+
+    // Preserve this device's action order; the SQL mutation itself is atomic
+    // with respect to operations arriving from the other platform.
+    operationQueue.current = operationQueue.current
+      .catch(() => {})
+      .then(async () => {
+        if (userIdRef.current !== ownerId) return;
+        const { data, error } = await supabase.rpc("mutate_cart", {
+          p_action: action,
+          p_product_id: productId,
+          p_item: item,
+          p_quantity: quantity,
+        });
+        if (error) {
+          console.error("[cart] mutation failed:", error.message);
+          return;
+        }
+        committedRevision.current = Math.max(committedRevision.current, revision);
+        if (revision === localRevision.current && userIdRef.current === ownerId) {
+          setItems(parseItems(data));
+        }
+      });
+  }, [userId, loadedUserId]);
 
   const addItem = useCallback((product: Product, quantity = 1) => {
-    setItems((prev) => {
-      const existing = prev.find((i) => i.productId === product.id);
-      if (existing) {
-        return prev.map((i) =>
-          i.productId === product.id
-            ? { ...i, quantity: i.quantity + quantity }
-            : i,
-        );
-      }
-      return [
-        ...prev,
-        {
-          productId: product.id,
-          slug: product.slug,
-          title: product.title,
-          imageUrl: product.imageUrl,
-          material: product.material,
-          priceCents: product.priceCents,
-          currency: product.currency,
-          quantity,
-        },
-      ];
+    const item: CartItem = {
+      productId: product.id,
+      slug: product.slug,
+      title: product.title,
+      imageUrl: product.imageUrl,
+      material: product.material,
+      priceCents: product.priceCents,
+      currency: product.currency,
+      quantity,
+    };
+    enqueueMutation("add", product.id, item, quantity, (current) => {
+      const existing = current.find((i) => i.productId === product.id);
+      return existing
+        ? current.map((i) => i.productId === product.id ? { ...i, quantity: i.quantity + quantity } : i)
+        : [...current, item];
     });
-  }, []);
+  }, [enqueueMutation]);
 
   const setQuantity = useCallback((productId: string, quantity: number) => {
-    setItems((prev) =>
+    enqueueMutation("set_quantity", productId, null, quantity, (current) =>
       quantity <= 0
-        ? prev.filter((i) => i.productId !== productId)
-        : prev.map((i) => (i.productId === productId ? { ...i, quantity } : i)),
+        ? current.filter((i) => i.productId !== productId)
+        : current.map((i) => i.productId === productId ? { ...i, quantity } : i),
     );
-  }, []);
+  }, [enqueueMutation]);
 
   const removeItem = useCallback((productId: string) => {
-    setItems((prev) => prev.filter((i) => i.productId !== productId));
-  }, []);
-
-  const clear = useCallback(() => setItems([]), []);
-
-  const value = useMemo<CartContextValue>(() => {
-    const itemCount = items.reduce((n, i) => n + i.quantity, 0);
-    const subtotalCents = items.reduce(
-      (n, i) => n + i.priceCents * i.quantity,
-      0,
+    enqueueMutation("remove", productId, null, null, (current) =>
+      current.filter((i) => i.productId !== productId),
     );
-    return {
-      items,
-      itemCount,
-      subtotalCents,
-      hydrated,
-      addItem,
-      setQuantity,
-      removeItem,
-      clear,
-    };
-  }, [items, hydrated, addItem, setQuantity, removeItem, clear]);
+  }, [enqueueMutation]);
+
+  const clear = useCallback(() => {
+    enqueueMutation("clear", null, null, null, () => []);
+  }, [enqueueMutation]);
+
+  const value = useMemo<CartContextValue>(() => ({
+    items,
+    itemCount: items.reduce((n, i) => n + i.quantity, 0),
+    subtotalCents: items.reduce((n, i) => n + i.priceCents * i.quantity, 0),
+    hydrated,
+    addItem,
+    setQuantity,
+    removeItem,
+    clear,
+  }), [items, hydrated, addItem, setQuantity, removeItem, clear]);
 
   return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
 }
